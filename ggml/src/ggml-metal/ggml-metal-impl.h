@@ -919,6 +919,23 @@ typedef struct {
 } ggml_metal_kargs_ssm_conv;
 
 typedef struct {
+    int32_t  nc;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_st;
+} ggml_metal_kargs_ssm_conv_front;
+
+typedef struct {
+    int32_t  head;
+    float    eps;
+    int32_t  perm_hd;
+    int32_t  perm_nk;
+    int32_t  perm_rep;
+    uint64_t nb_o;
+    uint64_t nb_z;
+} ggml_metal_kargs_gdn_tail;
+
+typedef struct {
     int64_t  d_state;
     int64_t  d_inner;
     int64_t  n_head;

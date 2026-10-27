@@ -66,6 +66,46 @@ kernel void kernel_ssm_conv_f32_f32_4(
     x[0] = FC_ssm_conv_silu ? sumf / (1.0f + exp(-sumf)) : sumf;
 }
 
+template <bool SILU>
+kernel void kernel_ssm_conv_front_f32(
+        constant ggml_metal_kargs_ssm_conv_front & args,
+        device const float * state,
+        device const char  * x,
+        device const float * w,
+        device       float * dst,
+        device       char  * st_out,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+    const int c   = tgpig.x*ntg.x + tpitg.x;
+    const int seq = tgpig.y;
+
+    if (c >= args.nc) {
+        return;
+    }
+
+    device const float * s = state + ((int64_t) seq*args.nc + c)*3;
+
+    const float xv = *(device const float *) (x + c*args.nb_x1 + seq*args.nb_x2);
+
+    const float4 sv = float4(s[0], s[1], s[2], xv);
+    const float4 cv = ((device const float4 *) w)[c];
+
+    float sumf = 0.0f;
+    sumf += dot(sv, cv);
+
+    dst[(int64_t) seq*args.nc + c] = SILU ? sumf / (1.0f + exp(-sumf)) : sumf;
+
+    device float * so = (device float *) (st_out + seq*args.nb_st) + c*3;
+    so[0] = s[1];
+    so[1] = s[2];
+    so[2] = xv;
+}
+
+typedef decltype(kernel_ssm_conv_front_f32<false>) kernel_ssm_conv_front_t;
+template [[host_name("kernel_ssm_conv_front_f32")]]      kernel kernel_ssm_conv_front_t kernel_ssm_conv_front_f32<false>;
+template [[host_name("kernel_ssm_conv_front_silu_f32")]] kernel kernel_ssm_conv_front_t kernel_ssm_conv_front_f32<true>;
+
 constant short FC_ssm_conv_bs   [[function_constant(FC_SSM_CONV + 0)]];
 
 // Batched version: each threadgroup processes multiple tokens for better efficiency

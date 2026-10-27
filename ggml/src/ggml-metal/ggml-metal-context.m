@@ -52,6 +52,22 @@ struct ggml_metal {
 
     id<MTLCaptureScope> capture_scope;
 
+    ggml_metal_prof_t prof;
+    int prof_period;
+    int prof_graphs;
+
+    int      gputime_period;
+    int      gputime_n_cb;
+    double   gputime_t0;
+    double   gputime_t1;
+    double   gputime_busy;
+    double   gputime_span_sum;
+    double   gputime_busy_sum;
+    int      gputime_graphs;
+    int64_t  gputime_wall_us;
+    int64_t  gputime_wall_sum;
+    NSLock * gputime_lock;
+
     // command buffer state
     int n_cb;           // number of extra threads used to submit the command buffers
     int n_nodes_0;      // number of nodes submitted by the main thread
@@ -171,6 +187,27 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->has_error = false;
 
+    res->prof = NULL;
+    {
+        const char * val = getenv("GGML_METAL_PROFILE");
+        if (val) {
+            res->prof_period = MAX(1, atoi(val));
+            res->prof        = ggml_metal_prof_init(dev);
+            GGML_LOG_INFO("%s: GPU profile        = %s, report every %d graphs\n", __func__, res->prof ? "true" : "false", res->prof_period);
+        }
+    }
+
+    res->gputime_period = 0;
+    {
+        const char * val = getenv("GGML_METAL_GPUTIME");
+        if (val) {
+            res->gputime_period = MAX(1, atoi(val));
+            res->gputime_lock   = [[NSLock alloc] init];
+            res->gputime_t0     = 1e300;
+            GGML_LOG_INFO("%s: GPU time           = report every %d graphs\n", __func__, res->gputime_period);
+        }
+    }
+
     res->gf = nil;
     res->encode_async = nil;
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
@@ -219,6 +256,11 @@ void ggml_metal_free(ggml_metal_t ctx) {
             // note: cannot use ggml_log here
             GGML_LOG_DEBUG("%s: - %s: %" PRIu64 "\n", __func__, ggml_op_name((enum ggml_op) i), ctx->fuse_cnt[i]);
         }
+    }
+
+    if (ctx->prof) {
+        ggml_metal_prof_report(ctx->prof);
+        ggml_metal_prof_free(ctx->prof);
     }
 
     Block_release(ctx->encode_async);
@@ -305,6 +347,19 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
 }
 
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (size == 0) {
+        return;
+    }
+
+    {
+        ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        if (ggml_metal_buffer_is_shared(buffer->context)) {
+            ggml_metal_synchronize(ctx);
+            memcpy((char *) tensor->data + offset, data, size);
+            return;
+        }
+    }
+
     @autoreleasepool {
         // wrap the source data into a Metal buffer
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
@@ -435,6 +490,36 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+static void ggml_metal_gputime_track(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf) {
+    if (!ctx->gputime_period) {
+        return;
+    }
+
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        [ctx->gputime_lock lock];
+
+        ctx->gputime_t0    = MIN(ctx->gputime_t0, cb.GPUStartTime);
+        ctx->gputime_t1    = MAX(ctx->gputime_t1, cb.GPUEndTime);
+        ctx->gputime_busy += cb.GPUEndTime - cb.GPUStartTime;
+
+        if (--ctx->gputime_n_cb == 0) {
+            ctx->gputime_span_sum += ctx->gputime_t1 - ctx->gputime_t0;
+            ctx->gputime_busy_sum += ctx->gputime_busy;
+            ctx->gputime_t0   = 1e300;
+            ctx->gputime_t1   = 0.0;
+            ctx->gputime_busy = 0.0;
+
+            if (++ctx->gputime_graphs % ctx->gputime_period == 0) {
+                const int n = ctx->gputime_graphs;
+                GGML_LOG_INFO("%s: %d graphs: GPU span %.3f ms/graph, GPU busy %.3f ms/graph, wall %.3f ms/graph\n", __func__,
+                        n, 1e3*ctx->gputime_span_sum/n, 1e3*ctx->gputime_busy_sum/n, ctx->gputime_wall_sum/1e3/MAX(1, n - 1));
+            }
+        }
+
+        [ctx->gputime_lock unlock];
+    }];
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
@@ -506,11 +591,21 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // short-hand
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
+        if (ctx->gputime_period) {
+            const int64_t t_now = ggml_time_us();
+            if (ctx->gputime_wall_us) {
+                ctx->gputime_wall_sum += t_now - ctx->gputime_wall_us;
+            }
+            ctx->gputime_wall_us = t_now;
+            ctx->gputime_n_cb = n_cb + 1;
+        }
+
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
         {
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
+            ggml_metal_gputime_track(ctx, cmd_buf);
 
             if (ctx->cmd_bufs[n_cb].obj) {
                 [ctx->cmd_bufs[n_cb].obj release];
@@ -530,6 +625,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
+            ggml_metal_gputime_track(ctx, cmd_buf);
 
             if (ctx->cmd_bufs[cb_idx].obj) {
                 [ctx->cmd_bufs[cb_idx].obj release];
@@ -551,6 +647,22 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
+
+        if (ctx->prof) {
+            for (int i = 0; i <= n_cb; ++i) {
+                id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[i].obj;
+                if ([cmd_buf status] == MTLCommandBufferStatusEnqueued) {
+                    [cmd_buf commit];
+                }
+                [cmd_buf waitUntilCompleted];
+            }
+
+            ggml_metal_prof_collect(ctx->prof);
+
+            if (++ctx->prof_graphs % ctx->prof_period == 0) {
+                ggml_metal_prof_report(ctx->prof);
+            }
+        }
 
         // enter here only when capturing in order to wait for all computation to finish
         // otherwise, we leave the graph to compute asynchronously
@@ -702,7 +814,8 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->use_concurrency,
             ctx->capture_compute,
             ctx->debug_graph,
-            ctx->debug_fusion);
+            ctx->debug_fusion,
+            ctx->prof);
 
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);

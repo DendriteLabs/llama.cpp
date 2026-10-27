@@ -496,7 +496,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // row in plane 0, gathered with its own row indices (s_copy carries the conv rollback plane)
     const bool gdn_rpl = inp->s_rpl_ctrl != nullptr;
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0 && !gdn_rpl;
+    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && !gdn_rpl &&
+        (cparams.n_rs_seq > 0 || mctx_cur->get_n_rs() == n_seqs);
 
     ggml_tensor * state;
     if (gdn_rpl) {

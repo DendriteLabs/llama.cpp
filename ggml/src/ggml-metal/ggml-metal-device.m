@@ -827,6 +827,222 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
 }
 
+
+#define GGML_METAL_PROF_SLOTS_PER_BUF 512
+#define GGML_METAL_PROF_BUFS          32
+#define GGML_METAL_PROF_SLOTS         (GGML_METAL_PROF_BUFS*GGML_METAL_PROF_SLOTS_PER_BUF)
+#define GGML_METAL_PROF_LABEL         96
+
+struct ggml_metal_prof_entry {
+    char     label[GGML_METAL_PROF_LABEL];
+    uint64_t n;
+    double   t_ns;
+};
+
+struct ggml_metal_prof {
+    id<MTLDevice> device;
+    id<MTLCounterSampleBuffer> bufs[GGML_METAL_PROF_BUFS];
+
+    char (*labels)[GGML_METAL_PROF_LABEL];
+    atomic_int n_used;
+    bool warned_full;
+
+    MTLTimestamp gpu0;
+    int64_t      t0_us;
+    double       ns_per_tick;
+
+    struct ggml_metal_prof_entry * entries;
+    int n_entries;
+    int n_graphs;
+};
+
+ggml_metal_prof_t ggml_metal_prof_init(ggml_metal_device_t dev) {
+    id<MTLDevice> device = ggml_metal_device_get_obj(dev);
+
+    id<MTLCounterSet> set_ts = nil;
+    for (id<MTLCounterSet> set in device.counterSets) {
+        if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+            set_ts = set;
+        }
+    }
+
+    if (!set_ts || ![device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        GGML_LOG_WARN("%s: GPU timestamp sampling at encoder boundaries is not supported on this device\n", __func__);
+        return NULL;
+    }
+
+    ggml_metal_prof_t res = calloc(1, sizeof(struct ggml_metal_prof));
+
+    res->device = device;
+    res->labels = calloc(GGML_METAL_PROF_SLOTS, GGML_METAL_PROF_LABEL);
+
+    MTLCounterSampleBufferDescriptor * desc = [[MTLCounterSampleBufferDescriptor alloc] init];
+    desc.counterSet  = set_ts;
+    desc.storageMode = MTLStorageModeShared;
+    desc.sampleCount = 2*GGML_METAL_PROF_SLOTS_PER_BUF;
+
+    for (int i = 0; i < GGML_METAL_PROF_BUFS; ++i) {
+        NSError * error = nil;
+        res->bufs[i] = [device newCounterSampleBufferWithDescriptor:desc error:&error];
+        if (!res->bufs[i]) {
+            GGML_LOG_WARN("%s: counter sample buffer %d: %s\n", __func__, i, [[error localizedDescription] UTF8String]);
+            [desc release];
+            ggml_metal_prof_free(res);
+            return NULL;
+        }
+    }
+
+    [desc release];
+
+    MTLTimestamp cpu0;
+    [device sampleTimestamps:&cpu0 gpuTimestamp:&res->gpu0];
+    res->t0_us = ggml_time_us();
+
+    return res;
+}
+
+void ggml_metal_prof_free(ggml_metal_prof_t prof) {
+    if (!prof) {
+        return;
+    }
+
+    for (int i = 0; i < GGML_METAL_PROF_BUFS; ++i) {
+        [prof->bufs[i] release];
+    }
+
+    free(prof->labels);
+    free(prof->entries);
+    free(prof);
+}
+
+int ggml_metal_prof_slot(ggml_metal_prof_t prof, const char * label) {
+    const int slot = atomic_fetch_add(&prof->n_used, 1);
+
+    if (slot >= GGML_METAL_PROF_SLOTS) {
+        if (!prof->warned_full) {
+            GGML_LOG_WARN("%s: more than %d encoders in one graph, the rest is not timed\n", __func__, GGML_METAL_PROF_SLOTS);
+            prof->warned_full = true;
+        }
+        return -1;
+    }
+
+    snprintf(prof->labels[slot], GGML_METAL_PROF_LABEL, "%s", label);
+
+    return slot;
+}
+
+ggml_metal_encoder_t ggml_metal_encoder_init_sampled(ggml_metal_cmd_buf_t cmd_buf_raw, ggml_metal_prof_t prof, int slot) {
+    ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
+
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    MTLComputePassDescriptor * desc = [MTLComputePassDescriptor computePassDescriptor];
+    desc.dispatchType = MTLDispatchTypeSerial;
+
+    MTLComputePassSampleBufferAttachmentDescriptor * att = desc.sampleBufferAttachments[0];
+    att.sampleBuffer              = prof->bufs[slot/GGML_METAL_PROF_SLOTS_PER_BUF];
+    att.startOfEncoderSampleIndex = 2*(slot % GGML_METAL_PROF_SLOTS_PER_BUF);
+    att.endOfEncoderSampleIndex   = att.startOfEncoderSampleIndex + 1;
+
+    res->obj = [cmd_buf computeCommandEncoderWithDescriptor:desc];
+
+    [res->obj retain];
+
+    return res;
+}
+
+static void ggml_metal_prof_add(ggml_metal_prof_t prof, const char * label, double t_ns) {
+    for (int i = 0; i < prof->n_entries; ++i) {
+        if (strcmp(prof->entries[i].label, label) == 0) {
+            prof->entries[i].n    += 1;
+            prof->entries[i].t_ns += t_ns;
+            return;
+        }
+    }
+
+    prof->entries = realloc(prof->entries, (prof->n_entries + 1)*sizeof(struct ggml_metal_prof_entry));
+
+    struct ggml_metal_prof_entry * e = &prof->entries[prof->n_entries++];
+    snprintf(e->label, sizeof(e->label), "%s", label);
+    e->n    = 1;
+    e->t_ns = t_ns;
+}
+
+void ggml_metal_prof_collect(ggml_metal_prof_t prof) {
+    const int n = MIN(atomic_load(&prof->n_used), GGML_METAL_PROF_SLOTS);
+
+    if (prof->ns_per_tick == 0.0) {
+        MTLTimestamp cpu1;
+        MTLTimestamp gpu1;
+        [prof->device sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
+
+        const int64_t dt_us = ggml_time_us() - prof->t0_us;
+        if (gpu1 > prof->gpu0 && dt_us > 0) {
+            prof->ns_per_tick = 1000.0*dt_us/(double) (gpu1 - prof->gpu0);
+        }
+    }
+
+    for (int b = 0; b*GGML_METAL_PROF_SLOTS_PER_BUF < n; ++b) {
+        const int n_b = MIN(GGML_METAL_PROF_SLOTS_PER_BUF, n - b*GGML_METAL_PROF_SLOTS_PER_BUF);
+
+        NSData * data = [prof->bufs[b] resolveCounterRange:NSMakeRange(0, 2*n_b)];
+        if (!data || data.length < 2*n_b*sizeof(MTLCounterResultTimestamp)) {
+            continue;
+        }
+
+        const MTLCounterResultTimestamp * ts = (const MTLCounterResultTimestamp *) data.bytes;
+
+        for (int i = 0; i < n_b; ++i) {
+            const uint64_t t0 = ts[2*i + 0].timestamp;
+            const uint64_t t1 = ts[2*i + 1].timestamp;
+
+            if (t0 == MTLCounterErrorValue || t1 == MTLCounterErrorValue || t1 < t0) {
+                continue;
+            }
+
+            ggml_metal_prof_add(prof, prof->labels[b*GGML_METAL_PROF_SLOTS_PER_BUF + i], (double) (t1 - t0)*prof->ns_per_tick);
+        }
+    }
+
+    atomic_store(&prof->n_used, 0);
+    prof->n_graphs++;
+}
+
+static int ggml_metal_prof_cmp(const void * a, const void * b) {
+    const double ta = ((const struct ggml_metal_prof_entry *) a)->t_ns;
+    const double tb = ((const struct ggml_metal_prof_entry *) b)->t_ns;
+    return ta < tb ? 1 : ta > tb ? -1 : 0;
+}
+
+void ggml_metal_prof_report(ggml_metal_prof_t prof) {
+    if (prof->n_graphs == 0 || prof->n_entries == 0) {
+        return;
+    }
+
+    struct ggml_metal_prof_entry * sorted = malloc(prof->n_entries*sizeof(struct ggml_metal_prof_entry));
+    memcpy(sorted, prof->entries, prof->n_entries*sizeof(struct ggml_metal_prof_entry));
+    qsort(sorted, prof->n_entries, sizeof(struct ggml_metal_prof_entry), ggml_metal_prof_cmp);
+
+    double   t_all = 0.0;
+    uint64_t n_all = 0;
+    for (int i = 0; i < prof->n_entries; ++i) {
+        t_all += sorted[i].t_ns;
+        n_all += sorted[i].n;
+    }
+
+    GGML_LOG_INFO("%s: %d graphs, %.1f encoders/graph, GPU busy %.3f ms/graph (ns/tick %.4f)\n", __func__,
+            prof->n_graphs, (double) n_all/prof->n_graphs, t_all/prof->n_graphs/1e6, prof->ns_per_tick);
+    GGML_LOG_INFO("%s: %6s %10s %10s %8s  %s\n", __func__, "share", "ms/graph", "us/call", "calls/g", "kernel");
+
+    for (int i = 0; i < prof->n_entries; ++i) {
+        const struct ggml_metal_prof_entry * e = &sorted[i];
+        GGML_LOG_INFO("%s: %5.1f%% %10.3f %10.2f %8.1f  %s\n", __func__,
+                100.0*e->t_ns/t_all, e->t_ns/prof->n_graphs/1e6, e->t_ns/e->n/1e3, (double) e->n/prof->n_graphs, e->label);
+    }
+
+    free(sorted);
+}
+
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
 

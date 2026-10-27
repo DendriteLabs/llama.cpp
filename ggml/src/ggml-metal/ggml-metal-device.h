@@ -93,6 +93,19 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
+
+typedef struct ggml_metal_prof * ggml_metal_prof_t;
+
+ggml_metal_prof_t ggml_metal_prof_init(ggml_metal_device_t dev);
+void ggml_metal_prof_free(ggml_metal_prof_t prof);
+
+int ggml_metal_prof_slot(ggml_metal_prof_t prof, const char * label);
+
+ggml_metal_encoder_t ggml_metal_encoder_init_sampled(ggml_metal_cmd_buf_t cmd_buf_raw, ggml_metal_prof_t prof, int slot);
+
+void ggml_metal_prof_collect(ggml_metal_prof_t prof);
+void ggml_metal_prof_report (ggml_metal_prof_t prof);
+
 //
 // MTLLibrary wrapper
 //
@@ -162,6 +175,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin_one  
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm        (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm              (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_add_rms_norm_mul  (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_mul_fwht (ggml_metal_library_t lib, int64_t ne00, bool add);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_front   (ggml_metal_library_t lib, bool silu);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gdn_tail_fwht    (ggml_metal_library_t lib, int64_t ne);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col            (ggml_metal_library_t lib, const struct ggml_tensor * op, bool use_ext);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_1d (ggml_metal_library_t lib, const struct ggml_tensor * op);
