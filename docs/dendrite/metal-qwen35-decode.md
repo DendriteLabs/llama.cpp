@@ -1,5 +1,7 @@
 # Metal decode speedups for Hadamard-rotated qwen35 models (October 2026)
 
+Commit: `49475161c`. Follow-up: [metal-qwen35-decode-2.md](metal-qwen35-decode-2.md).
+
 Single-sequence decode of Hadamard-rotated qwen35 models in the fork's 2-bit formats on Apple Silicon. The weights already streamed at about 93% of the chip's memory bandwidth, so the time left was in the roughly 1,700 small GPU dispatches per token; every change below either fuses neighbouring graph ops into one kernel or stops a kernel from re-reading data it already had.
 
 ## Results

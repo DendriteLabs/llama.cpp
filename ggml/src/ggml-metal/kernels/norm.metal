@@ -235,6 +235,11 @@ typedef decltype(kernel_add_rms_norm_mul_impl<float4>) kernel_add_rms_norm_mul_t
 template [[host_name("kernel_add_rms_norm_mul_f32")]]   kernel kernel_add_rms_norm_mul_t kernel_add_rms_norm_mul_impl<float>;
 template [[host_name("kernel_add_rms_norm_mul_f32_4")]] kernel kernel_add_rms_norm_mul_t kernel_add_rms_norm_mul_impl<float4>;
 
+// One 1024-thread threadgroup per row, float4 accesses: thread t holds float4 slots t and t + 1024 (the
+// same split as kernel_add_rms_norm_mul_impl<float4> with 1024 threads, so the sum of squares is the same).
+// Every load is issued before the first store: the device pointers may alias, so a store would otherwise
+// hold back the loads after it. Hadamard block N = 1024 = 256 float4: stages 1 and 2 inside the float4,
+// 4..64 by lane shuffles, 128..512 through threadgroup memory (NS*1024 float4).
 template <int N, int NB, bool ADD>
 kernel void kernel_rms_norm_mul_fwht_impl(
         constant ggml_metal_kargs_norm & args,
@@ -251,34 +256,56 @@ kernel void kernel_rms_norm_mul_fwht_impl(
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
         ushort  tiisg[[thread_index_in_simdgroup]]) {
     constexpr int NW  = N_SIMDWIDTH;
-    constexpr int NSG = N / NW;
+    constexpr int NT  = 1024;
+    constexpr int NQ  = N/4;
+    constexpr int NQT = NB*NQ;
+    constexpr int NS  = (NQT + NT - 1)/NT;
+    static_assert(N == 1024 && NT % NQ == 0, "kernel_rms_norm_mul_fwht: block of 1024");
 
     const int i01 = tgpig.x;
     const int i02 = tgpig.y;
     const int i03 = tgpig.z;
     const int tid = tpitg.x;
 
-    device const float * x  = (device const float *) (src0   + i03*args.nbf3[0] + i02*args.nbf2[0] + i01*args.nbf1[0]);
-    device const float * f0 = (device const float *) (src1_0 + (i03%args.nef3[1])*args.nbf3[1] + (i02%args.nef2[1])*args.nbf2[1] + (i01%args.nef1[1])*args.nbf1[1]);
-    device const float * b  = (device const float *) (src1_1 + (i03%args.nef3[2])*args.nbf3[2] + (i02%args.nef2[2])*args.nbf2[2] + (i01%args.nef1[2])*args.nbf1[2]);
+    device const float4 * x  = (device const float4 *) (src0   + i03*args.nbf3[0] + i02*args.nbf2[0] + i01*args.nbf1[0]);
+    device const float4 * f0 = (device const float4 *) (src1_0 + (i03%args.nef3[1])*args.nbf3[1] + (i02%args.nef2[1])*args.nbf2[1] + (i01%args.nef1[1])*args.nbf1[1]);
+    device const float4 * b  = (device const float4 *) (src1_1 + (i03%args.nef3[2])*args.nbf3[2] + (i02%args.nef2[2])*args.nbf2[2] + (i01%args.nef1[2])*args.nbf1[2]);
+    device const float4 * sg = (device const float4 *) signs;
 
-    device float * y = (device float *) (dst     + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
-    device float * s = (device float *) (dst_sum + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
-    device float * z = dst_fwht + ((int64_t) (i03*args.nef2[0] + i02)*args.nef1[0] + i01)*args.ne00;
+    device float4 * y = (device float4 *) (dst     + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+    device float4 * s = (device float4 *) (dst_sum + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+    device float4 * z = (device float4 *) (dst_fwht + ((int64_t) (i03*args.nef2[0] + i02)*args.nef1[0] + i01)*args.ne00);
 
-    float reg[NB];
-    float sumf = 0.0f;
+    if (sgitg == 0) {
+        shmem[tiisg] = 0.0f;
+    }
 
-    for (int k = 0; k < NB; ++k) {
-        float v = x[k*N + tid];
-        if (ADD) {
-            v += b[k*N + tid];
-            s[k*N + tid] = v;
+    float4 reg[NS];
+    float4 wv[NS];
+    float4 sv[NS];
+
+    for (int j = 0; j < NS; ++j) {
+        const int i = tid + j*NT;
+        reg[j] = 0.0f;
+        wv[j]  = 0.0f;
+        sv[j]  = 0.0f;
+        if (i < NQT) {
+            reg[j] = x[i];
+            if (ADD) {
+                reg[j] += b[i];
+            }
+            wv[j] = f0[i];
+            sv[j] = sg[i];
         }
-        reg[k] = v;
-        sumf += v*v;
+    }
+
+    float sumf = 0.0f;
+    for (int j = 0; j < NS; ++j) {
+        sumf += dot(reg[j], reg[j]);
     }
     sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tiisg == 0) {
         shmem[sgitg] = sumf;
@@ -286,43 +313,59 @@ kernel void kernel_rms_norm_mul_fwht_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    sumf = tiisg < NSG ? shmem[tiisg] : 0.0f;
+    sumf = shmem[tiisg];
     sumf = simd_sum(sumf);
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float scale = 1.0f/sqrt(sumf/args.ne00 + args.eps);
     const float hs    = 1.0f/sqrt((float) N);
 
-    for (int k = 0; k < NB; ++k) {
-        const float v = (reg[k]*scale)*f0[k*N + tid];
-        y[k*N + tid] = v;
-        reg[k] = v*signs[k*N + tid]*hs;
+    for (int j = 0; j < NS; ++j) {
+        const int i = tid + j*NT;
+        if (i < NQT) {
+            if (ADD) {
+                s[i] = reg[j];
+            }
+            const float4 v = (reg[j]*scale)*wv[j];
+            y[i] = v;
+            reg[j] = v*sv[j]*hs;
+        }
+    }
+
+    // element e = 4*i + c; the partner of stage m is e ^ m
+    for (int j = 0; j < NS; ++j) {
+        const float4 v = reg[j];
+        const float4 t = float4(v.y + v.x, v.x - v.y, v.w + v.z, v.z - v.w);
+        reg[j] = float4(t.z + t.x, t.w + t.y, t.x - t.z, t.y - t.w);
     }
 
     for (int i = 1; i < NW; i *= 2) {
-        for (int k = 0; k < NB; ++k) {
-            const float val  = reg[k];
-            const float val2 = simd_shuffle_xor(val, i);
-            reg[k] = (tid & i) == 0 ? val2 + val : val2 - val;
+        for (int j = 0; j < NS; ++j) {
+            const float4 v  = reg[j];
+            const float4 v2 = simd_shuffle_xor(v, i);
+            reg[j] = (tiisg & i) == 0 ? v2 + v : v2 - v;
         }
     }
 
-    for (int i = NW; i < N; i *= 2) {
-        for (int k = 0; k < NB; ++k) {
-            shmem[k*N + tid] = reg[k];
+    threadgroup float4 * sh = (threadgroup float4 *) shmem;
+
+    for (int i = NW; i < NQ; i *= 2) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = 0; j < NS; ++j) {
+            sh[j*NT + tid] = reg[j];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int k = 0; k < NB; ++k) {
-            const float val  = reg[k];
-            const float val2 = shmem[k*N + (tid ^ i)];
-            reg[k] = (tid & i) == 0 ? val2 + val : val2 - val;
+        for (int j = 0; j < NS; ++j) {
+            const float4 v  = reg[j];
+            const float4 v2 = sh[j*NT + (tid ^ i)];
+            reg[j] = (tid & i) == 0 ? v2 + v : v2 - v;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    for (int k = 0; k < NB; ++k) {
-        z[k*N + tid] = reg[k];
+    for (int j = 0; j < NS; ++j) {
+        const int i = tid + j*NT;
+        if (i < NQT) {
+            z[i] = reg[j];
+        }
     }
 }
 
@@ -345,8 +388,12 @@ template [[host_name("kernel_add_rms_norm_mul_fwht_1024_nb6")]] kernel kernel_rm
 template [[host_name("kernel_add_rms_norm_mul_fwht_1024_nb7")]] kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht_impl<1024, 7, true>;
 template [[host_name("kernel_add_rms_norm_mul_fwht_1024_nb8")]] kernel kernel_rms_norm_mul_fwht_t kernel_rms_norm_mul_fwht_impl<1024, 8, true>;
 
-template <int N, int NB>
-kernel void kernel_gdn_tail_fwht_impl(
+// One 256-thread threadgroup per 1024-wide output block of a row (float4 per thread): each thread finds the
+// source element of its output position through the inverse head permutation, so a simdgroup holds one
+// whole head (128 values) and its sum of squares is one simd_sum. Then the sign flip and the Hadamard
+// transform of the block (stages 1 and 2 inside the float4, 4..64 by lane shuffles, 128..512 through
+// threadgroup memory of 256 float4). Grid: x = block, y = row.
+kernel void kernel_gdn_tail_fwht(
         constant ggml_metal_kargs_gdn_tail & args,
         device const char  * o_raw,
         device const char  * z_raw,
@@ -359,101 +406,61 @@ kernel void kernel_gdn_tail_fwht_impl(
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
         ushort  tiisg[[thread_index_in_simdgroup]]) {
     constexpr int NW = N_SIMDWIDTH;
+    constexpr int NQ = 256;
 
-    const int row = tgpig.x;
+    const int blk = tgpig.x;
+    const int row = tgpig.y;
     const int tid = tpitg.x;
 
-    device const float * o = (device const float *) (o_raw + row*args.nb_o);
-    device const float * z = (device const float *) (z_raw + row*args.nb_z);
-    device       float * y = dst + (int64_t) row*NB*N;
+    device const float4 * o  = (device const float4 *) (o_raw + row*args.nb_o);
+    device const float4 * z  = (device const float4 *) (z_raw + row*args.nb_z);
+    device const float4 * w4 = (device const float4 *) w;
+    device const float4 * sg = (device const float4 *) signs;
+    device       float4 * y  = (device float4 *) (dst + (int64_t) row*args.ne) ;
 
-    threadgroup float * part = shmem;
-    threadgroup float * buf  = shmem + NB*NW;
+    const int i = blk*NQ + tid;
+    const int p = 4*i;
 
-    const int head = args.head;
+    const int hd  = p % args.perm_hd;
+    const int u   = p / args.perm_hd;
+    const int rep = u % args.perm_rep;
+    const int nk  = u / args.perm_rep;
+    const int e   = (rep*args.perm_nk + nk)*args.perm_hd + hd;
 
-    float v[NB];
+    const float4 v  = o[e/4];
+    const float  ss = simd_sum(dot(v, v));
 
-    for (int k = 0; k < NB; ++k) {
-        v[k] = o[k*N + tid];
-        const float ps = simd_sum(v[k]*v[k]);
-        if (tiisg == 0) {
-            part[k*NW + sgitg] = ps;
-        }
+    const float  scale = 1.0f/sqrt(ss/args.head + args.eps);
+    const float4 nrm   = (v*scale)*w4[hd/4];
+    const float4 x0    = z[e/4];
+    const float4 g     = (x0 / (1.0f + exp(-x0)))*nrm;
+
+    const float hs = 1.0f/sqrt(1024.0f);
+
+    float4 r = g*sg[i]*hs;
+
+    {
+        const float4 t = float4(r.y + r.x, r.x - r.y, r.w + r.z, r.z - r.w);
+        r = float4(t.z + t.x, t.w + t.y, t.x - t.z, t.y - t.w);
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const int sg_per_head = head/NW;
-    const int sg0 = (tid/head)*sg_per_head;
-
-    for (int k = 0; k < NB; ++k) {
-        float ss = 0.0f;
-        for (int j = 0; j < sg_per_head; ++j) {
-            ss += part[k*NW + sg0 + j];
-        }
-
-        const float scale = 1.0f/sqrt(ss/head + args.eps);
-
-        const int   e   = k*N + tid;
-        const float nrm = (v[k]*scale)*w[e % head];
-        const float x0  = z[e];
-        const float g   = (x0 / (1.0f + exp(-x0)))*nrm;
-
-        const int hd  = e % args.perm_hd;
-        const int t   = e / args.perm_hd;
-        const int nk  = t % args.perm_nk;
-        const int rep = t / args.perm_nk;
-
-        buf[hd + args.perm_hd*(rep + args.perm_rep*nk)] = g;
+    for (int m = 1; m < NW; m *= 2) {
+        const float4 r2 = simd_shuffle_xor(r, m);
+        r = (tiisg & m) == 0 ? r2 + r : r2 - r;
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float4 * sh = (threadgroup float4 *) shmem;
 
-    const float hs = 1.0f/sqrt((float) N);
-
-    float reg[NB];
-    for (int k = 0; k < NB; ++k) {
-        const int gi = k*N + tid;
-        reg[k] = buf[gi]*signs[gi]*hs;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (int i = 1; i < NW; i *= 2) {
-        for (int k = 0; k < NB; ++k) {
-            const float val  = reg[k];
-            const float val2 = simd_shuffle_xor(val, i);
-            reg[k] = (tid & i) == 0 ? val2 + val : val2 - val;
-        }
-    }
-
-    for (int i = NW; i < N; i *= 2) {
-        for (int k = 0; k < NB; ++k) {
-            buf[k*N + tid] = reg[k];
-        }
+    for (int m = NW; m < NQ; m *= 2) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int k = 0; k < NB; ++k) {
-            const float val  = reg[k];
-            const float val2 = buf[k*N + (tid ^ i)];
-            reg[k] = (tid & i) == 0 ? val2 + val : val2 - val;
-        }
+        sh[tid] = r;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float4 r2 = sh[tid ^ m];
+        r = (tid & m) == 0 ? r2 + r : r2 - r;
     }
 
-    for (int k = 0; k < NB; ++k) {
-        y[k*N + tid] = reg[k];
-    }
+    y[i] = r;
 }
-
-typedef decltype(kernel_gdn_tail_fwht_impl<1024, 1>) kernel_gdn_tail_fwht_t;
-
-template [[host_name("kernel_gdn_tail_fwht_1024_nb2")]] kernel kernel_gdn_tail_fwht_t kernel_gdn_tail_fwht_impl<1024, 2>;
-template [[host_name("kernel_gdn_tail_fwht_1024_nb3")]] kernel kernel_gdn_tail_fwht_t kernel_gdn_tail_fwht_impl<1024, 3>;
-template [[host_name("kernel_gdn_tail_fwht_1024_nb4")]] kernel kernel_gdn_tail_fwht_t kernel_gdn_tail_fwht_impl<1024, 4>;
-template [[host_name("kernel_gdn_tail_fwht_1024_nb5")]] kernel kernel_gdn_tail_fwht_t kernel_gdn_tail_fwht_impl<1024, 5>;
-template [[host_name("kernel_gdn_tail_fwht_1024_nb6")]] kernel kernel_gdn_tail_fwht_t kernel_gdn_tail_fwht_impl<1024, 6>;
-template [[host_name("kernel_gdn_tail_fwht_1024_nb8")]] kernel kernel_gdn_tail_fwht_t kernel_gdn_tail_fwht_impl<1024, 8>;
 
 template <typename T0, typename T>
 kernel void kernel_l2_norm_impl(

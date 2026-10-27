@@ -2071,24 +2071,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_mul_fwh
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
-    res.smem = ne00*sizeof(float);
+    res.smem = ((ne00/4 + 1023)/1024)*1024*4*sizeof(float);
 
     return res;
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gdn_tail_fwht(ggml_metal_library_t lib, int64_t ne) {
-    char base[256];
-    char name[256];
+    GGML_UNUSED(ne);
 
-    snprintf(base, 256, "kernel_gdn_tail_fwht_1024_nb%d", (int) (ne/1024));
-    snprintf(name, 256, "%s", base);
-
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, "kernel_gdn_tail_fwht");
     if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_gdn_tail_fwht", "kernel_gdn_tail_fwht", nullptr);
     }
 
-    res.smem = (ne/1024*32 + ne)*sizeof(float);
+    res.smem = 256*4*sizeof(float);
 
     return res;
 }

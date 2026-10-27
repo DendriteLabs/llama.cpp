@@ -933,6 +933,7 @@ typedef struct {
     int32_t  perm_rep;
     uint64_t nb_o;
     uint64_t nb_z;
+    int32_t  ne;
 } ggml_metal_kargs_gdn_tail;
 
 typedef struct {

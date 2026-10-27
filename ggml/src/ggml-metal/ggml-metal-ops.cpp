@@ -5118,7 +5118,7 @@ static bool ggml_metal_op_can_fuse_gdn_tail(ggml_metal_op_t ctx, int idx) {
     const int64_t ne   = norm->ne[0]*norm->ne[1];
     const int64_t rows = norm->ne[2]*norm->ne[3];
 
-    if (head % 32 != 0 || 1024 % head != 0 || ne % 1024 != 0 || ne/1024 < 2 || ne/1024 > 8 || ne/1024 == 7 ||
+    if (head != 128 || ne % 1024 != 0 ||
         norm->nb[1] != head*sizeof(float) || ggml_nelements(cont) != ne*rows) {
         if (dbg > 1) {
             GGML_LOG_DEBUG("%s: no gdn tail fuse: geometry head %lld ne %lld\n", __func__, (long long) head, (long long) ne);
@@ -5142,7 +5142,7 @@ static bool ggml_metal_op_can_fuse_gdn_tail(ggml_metal_op_t ctx, int idx) {
     }
 
     const int64_t hd = perm->ne[0], rep = perm->ne[1], nk = perm->ne[2];
-    if (hd*rep*nk != ne || perm->ne[3] != rows || perm->nb[0] != sizeof(float) ||
+    if (hd != head || hd*rep*nk != ne || perm->ne[3] != rows || perm->nb[0] != sizeof(float) ||
         perm->nb[1] != (size_t) hd*nk*sizeof(float) || perm->nb[2] != (size_t) hd*sizeof(float) || perm->nb[3] != (size_t) ne*sizeof(float)) {
         if (dbg > 1) {
             GGML_LOG_DEBUG("%s: no gdn tail fuse: permute %lld %lld %lld strides %zu %zu %zu\n", __func__, (long long) hd, (long long) rep, (long long) nk, (size_t) perm->nb[1], (size_t) perm->nb[2], (size_t) perm->nb[3]);
@@ -5199,7 +5199,7 @@ static bool ggml_metal_op_can_fuse_gdn_tail(ggml_metal_op_t ctx, int idx) {
         return false;
     }
 
-    return ggml_metal_pipeline_max_theads_per_threadgroup(ggml_metal_library_get_pipeline_gdn_tail_fwht(ctx->lib, ne)) >= 1024;
+    return ggml_metal_pipeline_max_theads_per_threadgroup(ggml_metal_library_get_pipeline_gdn_tail_fwht(ctx->lib, ne)) >= 256;
 }
 
 static int ggml_metal_op_gdn_tail(ggml_metal_op_t ctx, int idx) {
@@ -5233,6 +5233,7 @@ static int ggml_metal_op_gdn_tail(ggml_metal_op_t ctx, int idx) {
         /*.perm_rep =*/ (int32_t) perm->ne[1],
         /*.nb_o     =*/ (uint64_t) ne*sizeof(float),
         /*.nb_z     =*/ (uint64_t) ne*sizeof(float),
+        /*.ne       =*/ (int32_t) ne,
     };
 
     for (int i = 1; i < 6; ++i) {
@@ -5258,7 +5259,7 @@ static int ggml_metal_op_gdn_tail(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, rows, 1, 1, 1024, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, ne/1024, rows, 1, 256, 1, 1);
 
     return 6;
 }
