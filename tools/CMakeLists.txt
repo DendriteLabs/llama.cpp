@@ -29,6 +29,7 @@ else()
     endif()
     add_subdirectory(tokenize)
     add_subdirectory(mtp-export)  # ARC-LAB: MTP head training data
+    add_subdirectory(dflash-train)  # dendrite: DFlash drafter fine-tuning against a quantized target
     add_subdirectory(tts)
     add_subdirectory(mtmd)
     if (GGML_RPC)

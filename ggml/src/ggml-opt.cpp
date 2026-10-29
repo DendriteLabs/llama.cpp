@@ -496,6 +496,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     } else if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_GRAD) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         ggml_graph_reset(opt_ctx->gb_grad);
+        return; // dendrite: a gradients-only context has nothing more to build
     }
 
     GGML_ASSERT(opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT);
@@ -631,7 +632,9 @@ struct ggml_tensor * ggml_opt_ncorrect(ggml_opt_context_t opt_ctx) {
 }
 
 struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node) {
-    return ggml_graph_get_grad_acc(opt_ctx->gb_opt, node);
+    // dendrite: a gradients-only context (build type GRAD) has no gb_opt
+    struct ggml_cgraph * g = opt_ctx->gb_opt ? opt_ctx->gb_opt : opt_ctx->gb_grad;
+    return g ? ggml_graph_get_grad_acc(g, node) : NULL;
 }
 
 // ====== Optimization Result ======

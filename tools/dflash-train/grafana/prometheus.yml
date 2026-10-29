@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: dflash-train
+    static_configs:
+      # one target per trainer; host.docker.internal is the machine running docker, add remote boxes as host:port
+      - targets: ["host.docker.internal:9108"]
+        labels:
+          run: local

@@ -1964,7 +1964,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+    // dendrite: the f32 mmf kernel runs on TF32 tensor cores (about 1e-3 relative); an op that asks for
+    // GGML_PREC_F32 (training graphs) takes the cuBLAS path with CUBLAS_COMPUTE_32F instead
+    const bool want_f32 = src0->type == GGML_TYPE_F32 && dst->op_params[0] == GGML_PREC_F32;
+    if (!want_f32 && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }

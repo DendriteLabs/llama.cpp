@@ -1770,7 +1770,10 @@ struct ggml_backend_cuda_context {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
+            // dendrite: TF32 (about 1e-3 relative) is fine for inference; GGML_CUDA_NO_TF32=1 keeps f32 GEMMs
+            // in f32 for training (llama-dflash-train sets it)
+            static const bool no_tf32 = getenv("GGML_CUDA_NO_TF32") != nullptr;
+            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], no_tf32 ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH));
             CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
             if (cublas_workspace_sizes[device] == 0) {

@@ -7053,6 +7053,27 @@ static void ggml_compute_backward(
                 // dsrc1 = dtensor * 0 -> noop
             }
         } break;
+        case GGML_OP_CONCAT: {
+            // dendrite: each source takes back its slice of the gradient along the concat dim
+            const int dim = ggml_get_op_params_i32(tensor, 0);
+            GGML_ASSERT(dim >= 0 && dim < GGML_MAX_DIMS);
+            if (!ggml_is_contiguous(grad)) {
+                grad = ggml_cont(ctx, grad);
+            }
+            if (src0_needs_grads) {
+                struct ggml_tensor * g0 = ggml_view_4d(ctx, grad,
+                        src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                        grad->nb[1], grad->nb[2], grad->nb[3], 0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, g0));
+            }
+            if (src1_needs_grads) {
+                const size_t offset = (size_t) src0->ne[dim] * grad->nb[dim];
+                struct ggml_tensor * g1 = ggml_view_4d(ctx, grad,
+                        src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                        grad->nb[1], grad->nb[2], grad->nb[3], offset);
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, g1));
+            }
+        } break;
         case GGML_OP_CONT: {
             // same as cpy
             if (src0_needs_grads) {
