@@ -3002,6 +3002,32 @@ static bool ggml_metal_op_mul_mat_q1_0_pc_supported(const ggml_tensor * op) {
     return ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1;
 }
 
+// env knobs of the few-row tensor tile: <prefix>=0 disables it, <prefix>_MIN/_MAX bound the src1 rows, <prefix>_CFG picks the split
+struct ggml_metal_fewrow_knobs {
+    bool on;
+    int  min;
+    int  max;
+    int  cfg;
+};
+
+static ggml_metal_fewrow_knobs ggml_metal_fewrow_knobs_read(const char * prefix, int min_def) {
+    char name[64];
+    ggml_metal_fewrow_knobs res;
+
+    res.on = !getenv(prefix) || atoi(getenv(prefix)) != 0;
+
+    snprintf(name, sizeof(name), "%s_MIN", prefix);
+    res.min = getenv(name) ? atoi(getenv(name)) : min_def;
+
+    snprintf(name, sizeof(name), "%s_MAX", prefix);
+    res.max = getenv(name) ? atoi(getenv(name)) : 32;
+
+    snprintf(name, sizeof(name), "%s_CFG", prefix);
+    res.cfg = getenv(name) ? atoi(getenv(name)) : 0;
+
+    return res;
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3128,29 +3154,32 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         return 1;
     }
 
-    // PQ2_0 at speculative verify widths: a register-resident tensor-unit tile of 16 src1
-    // rows by 32 weight rows (see kernel_mul_mm_pq2_0_f32_fewrow). The generic tensor
-    // mul_mm tile is 64 x 128 and mul_mv_ext is ALU-bound at 2..8 columns.
-    // M5 Pro, 17408 x 5120: 1.24x over the 3-column mul_mv at n = 3, 1.6-3.1x over mul_mv_ext at
+    // PQ2_0 and PTQ1_0 at speculative verify widths: a register-resident tensor-unit tile of 16 src1
+    // rows by 32 weight rows (see kernel_mul_mm_pq2_0_f32_fewrow and kernel_mul_mm_ptq1_0_f32_fewrow).
+    // The generic tensor mul_mm tile is 64 x 128 and mul_mv_ext is ALU-bound at 2..8 columns.
+    // PQ2_0 on M5 Pro, 17408 x 5120: 1.24x over the 3-column mul_mv at n = 3, 1.6-3.1x over mul_mv_ext at
     // n = 4..8 and ~5x over mul_mm at n = 9..16; slower at n = 1..2, so it starts at 3.
-    // GGML_METAL_PQ2_0_FEWROW=0 disables it; GGML_METAL_PQ2_0_FEWROW_MIN/_MAX set the src1
-    // row range; GGML_METAL_PQ2_0_FEWROW_CFG=<ncb><nks> (14 default, 22, 41, 12, 21) picks the split.
+    // PTQ1_0 starts at 2: its default 2-column path is the generic mul_mv_ext, not a multi-column mul_mv.
+    // GGML_METAL_PQ2_0_FEWROW=0 / GGML_METAL_PTQ1_0_FEWROW=0 disables it; <prefix>_MIN/_MAX set the src1
+    // row range; <prefix>_CFG=<ncb><nks> (14 default, 22, 41, 12, 21) picks the split.
     {
-        static const bool fewrow_on  = !getenv("GGML_METAL_PQ2_0_FEWROW") || atoi(getenv("GGML_METAL_PQ2_0_FEWROW")) != 0;
-        static const int  fewrow_min = getenv("GGML_METAL_PQ2_0_FEWROW_MIN") ? atoi(getenv("GGML_METAL_PQ2_0_FEWROW_MIN")) : 3;
-        static const int  fewrow_max = getenv("GGML_METAL_PQ2_0_FEWROW_MAX") ? atoi(getenv("GGML_METAL_PQ2_0_FEWROW_MAX")) : 32;
-        static const int  fewrow_cfg = getenv("GGML_METAL_PQ2_0_FEWROW_CFG") ? atoi(getenv("GGML_METAL_PQ2_0_FEWROW_CFG")) : 0;
+        static const ggml_metal_fewrow_knobs pq2_0_fewrow  = ggml_metal_fewrow_knobs_read("GGML_METAL_PQ2_0_FEWROW",  3);
+        static const ggml_metal_fewrow_knobs ptq1_0_fewrow = ggml_metal_fewrow_knobs_read("GGML_METAL_PTQ1_0_FEWROW", 2);
 
-        if (fewrow_on && props_dev->has_tensor &&
-            op->src[0]->type == GGML_TYPE_PQ2_0 && op->src[1]->type == GGML_TYPE_F32 &&
-            ne11 >= fewrow_min && ne11 <= fewrow_max &&
-            ne00 % 128 == 0 && // QK_PQ2_0
+        const ggml_metal_fewrow_knobs * fewrow =
+            op->src[0]->type == GGML_TYPE_PQ2_0  ? &pq2_0_fewrow  :
+            op->src[0]->type == GGML_TYPE_PTQ1_0 ? &ptq1_0_fewrow : nullptr;
+
+        if (fewrow && fewrow->on && props_dev->has_tensor &&
+            op->src[1]->type == GGML_TYPE_F32 &&
+            ne11 >= fewrow->min && ne11 <= fewrow->max &&
+            ne00 % 128 == 0 && // QK_PQ2_0 == QK_PTQ1_0
             ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             nb10 == sizeof(float) && nb11 % 16 == 0 &&
             ggml_is_contiguous(op)) {
             int ncb = 1;
             int nks = 4;
-            switch (fewrow_cfg) {
+            switch (fewrow->cfg) {
                 case 14: ncb = 1; nks = 4; break;
                 case 22: ncb = 2; nks = 2; break;
                 case 41: ncb = 4; nks = 1; break;
@@ -3159,7 +3188,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
                 default: break;
             }
 
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_pq2_0_fewrow(lib, ncb, nks);
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_fewrow(lib, op, ncb, nks);
 
             ggml_metal_kargs_mul_mm_fewrow args = {
                 /*.ne00 =*/ ne00,

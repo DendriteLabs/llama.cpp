@@ -497,6 +497,155 @@ template [[host_name("kernel_mul_mm_pq2_0_f32_fewrow_cb4_ks1")]] kernel mul_mm_p
 template [[host_name("kernel_mul_mm_pq2_0_f32_fewrow_cb1_ks2")]] kernel mul_mm_pq2_0_fewrow_t kernel_mul_mm_pq2_0_f32_fewrow<1, 2>;
 template [[host_name("kernel_mul_mm_pq2_0_f32_fewrow_cb2_ks1")]] kernel mul_mm_pq2_0_fewrow_t kernel_mul_mm_pq2_0_f32_fewrow<2, 1>;
 
+// PTQ1_0 x F32 for a few src1 rows: the PQ2_0 tile above with the trit decode of
+// dequantize_ptq1_0 (same floor recurrence, so the half weights match mul_mm bit for bit).
+// A lane's 4 k values of a step are 4 bytes of the block at one trit index, in the CPU
+// codec's element order: steps 0..4 are qs[fn..fn+3] at trit st, steps 5 and 6 are
+// qs[16+(fn&7)..] at trit fn>>3 and 2+(fn>>3), step 7 is the same bytes at trit 4 for
+// fn < 8 and the qh pair (qh0, qh1, qh0, qh1) at trits (0,0,1,1) or (2,2,3,3) for fn >= 8.
+template <short NCB, short NKS>
+kernel void kernel_mul_mm_ptq1_0_f32_fewrow(
+        constant ggml_metal_kargs_mul_mm_fewrow & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const int K = args.ne00;
+    const int N = args.ne01;
+    const int M = args.ne11;
+
+    const short cb = sgitg / NKS;
+    const short ks = sgitg % NKS;
+
+    const int col0 = (tgpig.x*NCB + cb)*32;
+    const int row0 = tgpig.y*16;
+
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+            16, 32, 16, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> mm;
+
+    auto cA = mm.get_left_input_cooperative_tensor<half, half, float>();
+    auto cB = mm.get_right_input_cooperative_tensor<half, half, float>();
+    auto cC = mm.get_destination_cooperative_tensor<remove_addrspace_t<decltype(cA)>, remove_addrspace_t<decltype(cB)>, float>();
+
+    FOR_UNROLL (short i = 0; i < 16; ++i) {
+        cC[i] = 0.0f;
+    }
+
+    const short fn = 4*(tiisg & 1) + 8*((tiisg >> 3) & 1);
+    const short fm = ((tiisg >> 1) & 3) | (((tiisg >> 4) & 1) << 2);
+
+    // 3^n of this lane's trit index at steps 5, 6 and 7
+    const bool   hi = fn >= 8;
+    const float  c5 = hi ? 3.0f : 1.0f;
+    const float  c6 = 9.0f*c5;
+    const float  cq = fn == 8 ? 1.0f : 9.0f;
+    const float4 c7 = hi ? float4(cq, cq, 3.0f*cq, 3.0f*cq) : float4(81.0f);
+
+    const float pow3f[6] = {1.0f, 3.0f, 9.0f, 27.0f, 81.0f, 243.0f};
+
+    device const block_ptq1_0 * wrow[4];
+    FOR_UNROLL (short j = 0; j < 4; ++j) {
+        wrow[j] = (device const block_ptq1_0 *) (src0 + args.nb01*min(col0 + fm + 8*j, N - 1));
+    }
+
+    device const float * x0 = (device const float *) (src1 + args.nb11*min(row0 + fm,     M - 1)) + fn;
+    device const float * x1 = (device const float *) (src1 + args.nb11*min(row0 + fm + 8, M - 1)) + fn;
+
+    const int nb = K/QK_PTQ1_0;
+
+    for (int ib = ks; ib < nb; ib += NKS) {
+        float4 ua[4];
+        float4 ub[4];
+        float4 g[4];
+        uint   wh[4];
+        float  d[4];
+        FOR_UNROLL (short j = 0; j < 4; ++j) {
+            device const uchar * qs = wrow[j][ib].qs;
+            const uint wa = *((device const uint *) (qs + fn));
+            const uint wb = *((device const uint *) (qs + 16 + (fn & 7)));
+            ua[j] = float4(as_type<uchar4>(wa)) * (1.0f/256.0f);
+            ub[j] = float4(as_type<uchar4>(wb)) * (1.0f/256.0f);
+            g[j]  = float4(0.0f);
+            wh[j] = *((device const ushort *) wrow[j][ib].qh);
+            d[j]  = wrow[j][ib].d;
+        }
+
+        FOR_UNROLL (short st = 0; st < 8; ++st) {
+            const int k = ib*QK_PTQ1_0 + st*16;
+
+            const float4 xa = *((device const float4 *) (x0 + k));
+            const float4 xb = *((device const float4 *) (x1 + k));
+            FOR_UNROLL (short q = 0; q < 4; ++q) {
+                cA[q]     = (half) xa[q];
+                cA[4 + q] = (half) xb[q];
+            }
+
+            FOR_UNROLL (short j = 0; j < 4; ++j) {
+                float4 t;
+                if (st < 5) {
+                    // g[j] holds floor(3^st * u) from the previous step
+                    const float4 gn = floor(pow3f[st + 1]*ua[j]);
+                    t    = gn - 3.0f*g[j];
+                    g[j] = gn;
+                } else if (st == 5) {
+                    t = floor(3.0f*c5*ub[j]) - 3.0f*floor(c5*ub[j]);
+                } else if (st == 6) {
+                    t = floor(3.0f*c6*ub[j]) - 3.0f*floor(c6*ub[j]);
+                } else {
+                    const float4 u7 = hi ? float4(as_type<uchar4>(wh[j] | (wh[j] << 16))) * (1.0f/256.0f) : ub[j];
+                    t = floor(3.0f*c7*u7) - 3.0f*floor(c7*u7);
+                }
+                const float4 v = (t - 1.0f)*d[j];
+                FOR_UNROLL (short q = 0; q < 4; ++q) {
+                    cB[4*j + q] = (half) v[q];
+                }
+            }
+
+            mm.run(cA, cB, cC);
+        }
+    }
+
+    if (NKS > 1) {
+        threadgroup float * red = (threadgroup float *) shmem + cb*(NKS - 1)*16*32;
+        if (ks > 0) {
+            FOR_UNROLL (short i = 0; i < 16; ++i) {
+                red[((ks - 1)*16 + i)*32 + tiisg] = cC[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (ks > 0) {
+            return;
+        }
+        FOR_UNROLL (short s = 1; s < NKS; ++s) {
+            FOR_UNROLL (short i = 0; i < 16; ++i) {
+                cC[i] += red[((s - 1)*16 + i)*32 + tiisg];
+            }
+        }
+    }
+
+    device float * y = (device float *) dst;
+    FOR_UNROLL (short i = 0; i < 16; ++i) {
+        const int m = row0 + fm + 8*((i >> 2) & 1);
+        const int n = col0 + fn + (i & 3) + 16*(i >> 3);
+        if (m < M && n < N) {
+            y[m*args.ne0 + n] = cC[i];
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_ptq1_0_f32_fewrow<1, 4>) mul_mm_ptq1_0_fewrow_t;
+
+template [[host_name("kernel_mul_mm_ptq1_0_f32_fewrow_cb1_ks4")]] kernel mul_mm_ptq1_0_fewrow_t kernel_mul_mm_ptq1_0_f32_fewrow<1, 4>;
+template [[host_name("kernel_mul_mm_ptq1_0_f32_fewrow_cb2_ks2")]] kernel mul_mm_ptq1_0_fewrow_t kernel_mul_mm_ptq1_0_f32_fewrow<2, 2>;
+template [[host_name("kernel_mul_mm_ptq1_0_f32_fewrow_cb4_ks1")]] kernel mul_mm_ptq1_0_fewrow_t kernel_mul_mm_ptq1_0_f32_fewrow<4, 1>;
+template [[host_name("kernel_mul_mm_ptq1_0_f32_fewrow_cb1_ks2")]] kernel mul_mm_ptq1_0_fewrow_t kernel_mul_mm_ptq1_0_f32_fewrow<1, 2>;
+template [[host_name("kernel_mul_mm_ptq1_0_f32_fewrow_cb2_ks1")]] kernel mul_mm_ptq1_0_fewrow_t kernel_mul_mm_ptq1_0_f32_fewrow<2, 1>;
+
 #endif // GGML_METAL_HAS_TENSOR
 
 template<short ne20> // n_expert_used
